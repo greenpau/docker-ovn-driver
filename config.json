@@ -1,0 +1,171 @@
+{
+    "description": "Docker network driver for Open Virtual Network (OVN)",
+    "documentation": "https://docs.docker.com/engine/extend/config/",
+    "entrypoint": [
+        "/docker-entrypoint.sh"
+    ],
+    "args": {},
+    "env": [
+        {
+            "name": "DEBUG",
+            "settable": [
+                "value"
+            ],
+            "value": "0"
+        },
+        {
+            "name": "OVN_DRIVER_CMD",
+            "settable": [
+                "value"
+            ],
+            "value": "/usr/bin/docker-ovn-driver"
+        },
+        {
+            "name": "OVN_DRIVER_ADDR",
+            "settable": [
+                "value"
+            ],
+            "value": "0.0.0.0"
+        },
+        {
+            "name": "OVN_DRIVER_PORT",
+            "settable": [
+                "value"
+            ],
+            "value": "9105"
+        },
+        {
+            "name": "OVN_DOCKER_OPTS",
+            "settable": [
+                "value"
+            ],
+            "value": "--distributed --log-file /var/log/openvswitch/docker-ovn-driver.log --health-check-on --health-check-interval 30 --ip-lookup --docker-driver-scope local --bind-ip 0.0.0.0 --bind-port 9105 --verbose console:off --verbose syslog:off"
+        }
+    ],
+    "interface": {
+        "socket": "ovn.sock",
+        "types": [
+            "docker.networkdriver/1.0"
+        ]
+    },
+    "linux": {
+        "capabilities": [
+            "CAP_SYS_ADMIN",
+            "CAP_NET_ADMIN"
+        ]
+    },
+    "mounts": [
+        {
+            "destination": "/run/docker/plugins",
+            "name": "run_docker_plugins",
+            "options": [
+                "rbind"
+            ],
+            "settable": [
+                "source"
+            ],
+            "source": "/run/docker/plugins",
+            "type": "bind"
+        },
+        {
+            "destination": "/var/run/docker",
+            "name": "var_run_docker",
+            "options": [
+                "rbind"
+            ],
+            "settable": [
+                "source"
+            ],
+            "source": "/var/run/docker",
+            "type": "bind"
+        },
+        {
+            "destination": "/var/run/docker.sock",
+            "name": "var_run_docker_sock",
+            "options": [
+                "rbind"
+            ],
+            "settable": [
+                "source"
+            ],
+            "source": "/var/run/docker.sock",
+            "type": "bind"
+        },
+        {
+            "destination": "/var/run/openvswitch",
+            "name": "var_run_openvswitch",
+            "options": [
+                "rbind"
+            ],
+            "settable": [
+                "source"
+            ],
+            "source": "/var/run/openvswitch",
+            "type": "bind"
+        },
+        {
+            "destination": "/var/lib/openvswitch",
+            "name": "var_lib_openvswitch",
+            "options": [
+                "rbind"
+            ],
+            "settable": [
+                "source"
+            ],
+            "source": "/var/lib/openvswitch",
+            "type": "bind"
+        },
+        {
+            "destination": "/var/log/openvswitch",
+            "name": "var_log_openvswitch",
+            "options": [
+                "rbind"
+            ],
+            "settable": [
+                "source"
+            ],
+            "source": "/var/log/openvswitch",
+            "type": "bind"
+        },
+        {
+            "destination": "/etc/openvswitch",
+            "name": "etc_openvswitch",
+            "options": [
+                "rbind"
+            ],
+            "settable": [
+                "source"
+            ],
+            "source": "/etc/openvswitch",
+            "type": "bind"
+        },
+        {
+            "destination": "/etc/ssl/ovn",
+            "name": "etc_ssl_ovn",
+            "options": [
+                "rbind"
+            ],
+            "settable": [
+                "source"
+            ],
+            "source": "/etc/ssl/ovn",
+            "type": "bind"
+        },
+        {
+            "destination": "/usr/share/openvswitch",
+            "name": "usr_share_openvswitch",
+            "options": [
+                "rbind"
+            ],
+            "settable": [
+                "source"
+            ],
+            "source": "/usr/share/openvswitch",
+            "type": "bind"
+        }
+    ],
+    "network": {
+        "type": "host"
+    },
+    "workdir": "/"
+}

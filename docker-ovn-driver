@@ -1,0 +1,1708 @@
+#!/usr/bin/python
+# Copyright (C) 2018 Paul Greenberg (greenpau@outlook.com)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import json
+import os
+import random
+import re
+import shlex
+import subprocess
+import sys
+import time
+import hashlib
+from threading import Thread, Lock
+import pickle
+import signal
+import operator
+from functools import reduce
+import traceback
+
+import ovs.dirs
+import ovs.util
+import ovs.daemon
+import ovs.vlog
+
+from flask import Flask, jsonify, request, abort
+
+OVN_PLUGIN = "docker-ovn-driver"
+OVN_BRIDGE = "br-int"
+OVN_NB = ""
+OVN_SYSTEM_ID_FILE = "/etc/openvswitch/system-id.conf"
+OVN_SYSTEM_ID = ""
+OVS_PORT_SEC_L2_TABLE = 8
+OVS_PORT_SEC_IP_TABLE = 9
+OVS_IP_LOOKUP_TABLE = 200
+
+app = Flask(__name__)
+app_db = {}
+app_lock = Lock()
+vlog = ovs.vlog.Vlog(OVN_PLUGIN)
+
+def call_popen(cmd):
+    timer = time.time()
+    child = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    output = child.communicate()
+    vlog.dbg("Executed shell command in %5fs : %s" % ((time.time() - timer), ' '.join(cmd)))
+    if child.returncode:
+        raise RuntimeError("Fatal error executing %s" % (cmd))
+    if len(output) == 0 or output[0] == None:
+        output = ""
+    else:
+        output = output[0].strip()
+    return output
+
+
+def call_prog(prog, args_list):
+    cmd = [prog, "--timeout=5", "-vconsole:off"] + args_list
+    return call_popen(cmd)
+
+
+def ovs_ofctl(*args):
+    timer = time.time()
+    cmd = ["ovs-ofctl", "--timeout=5"]
+    cmd.extend(list(args))
+    child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output = child.communicate()
+    if child.returncode:
+        error = "%s" % cmd
+        if output[1]:
+            error = "%s" % (output[1])
+        vlog.warn("Executed shell command in %5fs : %s, but received: %s" % ((time.time() - timer), ' '.join(cmd), error))
+        raise RuntimeError(error)
+    vlog.dbg("Executed shell command in %5fs : %s" % ((time.time() - timer), ' '.join(cmd)))
+    if len(output) == 0 or output[0] == None:
+        output = ""
+    else:
+        output = output[0].strip()
+    return output
+
+
+def ovs_vsctl(*args):
+    return call_prog("ovs-vsctl", list(args))
+
+def exec_cmd(params, ovs_cmd=False):
+    resp = {}
+    if ovs_cmd:
+        params.insert(1, "-vconsole:off")
+        params.insert(1, "--timeout=5")
+    timer = time.time()
+    try:
+        p = subprocess.Popen(params, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        output = p.communicate()
+        if hasattr(p, 'returncode'):
+            resp['return_code'] = p.returncode
+        else:
+            resp['return_code'] = 1
+        if output:
+            if len(output) == 2:
+                if output[0]:
+                    resp['data'] = str(output[0]).strip().split('\n')
+                if output[1]:
+                    resp['error'] = "%s" % (output[1])
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        resp['return_code'] = 1
+        err = "%s: %s" % (exc_type.__name__, exc_value)
+        for exc_line in traceback.format_tb(exc_traceback):
+            err += "\n%s" % (exc_line)
+        resp['error'] = err
+    resp['time'] = time.time() - timer
+    if resp['return_code'] == 0 and 'data' not in resp:
+        resp['data'] = []
+    vlog.dbg("Executed shell command: %s, result: %s" % (" ".join(params), resp))
+    return resp
+
+
+def ovn_nbctl(*args):
+    if 'ovn_nb' not in app_db:
+        if ovn_init_driver():
+            return {'error': 'OVN NB address is not available', 'return_code': 1}
+        if 'ovn_nb' not in app_db:
+            return {'error': 'OVN NB address is not available', 'return_code': 1}
+    cmd = list(args)
+    for field in [("--ca-cert", "tls_private_key"), ("--certificate", "tls_key_cert"), ("--private-key", "tls_ca_cert")]:
+        if field[1] not in app_db:
+            continue
+        cmd.insert(0, "%s=%s" % (field[0], app_db[field[1]]))
+    cmd.insert(0, "%s=%s" % ("--db", app_db['ovn_nb']))
+    cmd.insert(0, "ovn-nbctl")
+    resp = None
+    try:
+        resp = exec_cmd(cmd, ovs_cmd=True)
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        resp = {
+            'error': "ovn-nbctl error: %s: %s" % (exc_type.__name__, exc_value),
+            'return_code': 1,
+        }
+    if resp:
+        if 'error' in resp:
+            ovn_init_driver()
+    return resp
+
+
+def ovs_shutdown_driver(signal_id=0, stack_frame=None):
+    global app_db
+    signals = dict((k, v) for v, k in reversed(sorted(signal.__dict__.items())) if v.startswith('SIG') and not v.startswith('SIG_'));
+    vlog.info("received driver shutdown signal (%s/%d)" % (signals[signal_id], signal_id))
+    if os.path.isfile(app_db['docker_plugin_file']):
+        os.remove(app_db['docker_plugin_file'])
+    if app_db['distributed']:
+        if not os.path.isdir(app_db['plugin_libdir']):
+            os.makedirs(app_db['plugin_libdir'])
+            vlog.info("created: %s" % (app_db['plugin_libdir']))
+        with app_lock:
+            with open(app_db['plugin_cache'], 'wb') as f:
+                pickle.dump(app_db['networks'], f, pickle.HIGHEST_PROTOCOL)
+            vlog.info("saved networks to local cache: %s" % (app_db['plugin_cache']))
+    sys.exit()
+
+
+signal.signal(signal.SIGTERM, ovs_shutdown_driver)
+
+
+def docker_ctl(cmd, **kwargs):
+    global app_db
+    resp = {}
+    timer = time.time()
+    if cmd not in ['info', 'networks', 'container']:
+        return {"error": "This plugin does not support Docker API request: %s" % (cmd)}
+    try:
+        client = docker.DockerClient(base_url=app_db['docker_socket'], version=app_db['docker_api_version'])
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        return {"error": "socket: %s, error: %s: %s" % (app_db['docker_socket'], exc_type.__name__, exc_value)}
+
+    try:
+        if cmd == 'info':
+            resp['data'] = client.info()
+        elif cmd == 'networks':
+            resp['data'] = client.networks.list()
+        elif cmd == 'container':
+            _id = kwargs.get('container_id', None)
+            if not _id:
+                resp['error'] = "plugin error: container_id was not provided: %s" % (cmd)
+                return resp
+            else:
+                resp['data'] = client.containers.get(_id)
+        else:
+            pass
+        vlog.dbg("Executed Docker API %s request in %5fs" % (cmd, (time.time() - timer)));
+        client.close();
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        #for exc_line in traceback.format_tb(exc_traceback):
+        #    vlog.warn("docker error: %s" % (exc_line))
+        return {"error": "socket: %s, %s: %s" % (app_db['docker_socket'], exc_type.__name__, exc_value)}
+    finally:
+        client.close()
+    return resp
+
+
+def ovn_docker_health_check():
+    global app_db
+    docker_thread = Thread(target=ovn_docker_health_check_thread, args=[app_db['health_check_interval']]);
+    docker_thread.name = 'health-check'
+    docker_thread.daemon = True;
+    docker_thread.start();
+
+
+def docker_engine():
+    resp = {}
+    req = docker_ctl('info')
+    if req.get('error'):
+        return {"error": req.get('error')}
+    data = req.get('data')
+    if app_db['docker_driver_scope'] == 'global':
+        '''
+        First, acquire information about key-value store used by Docker engine.
+        Ocassionally, Docker libnetwork fails to properly cleanup networks in a
+        key-value store. In that case, the plugin connects to the key-value store
+        and diagnoses the issue.
+        '''
+        if data.get('ClusterStore'):
+            resp['kv_store_url'] = data.get('ClusterStore');
+            resp['kv_store'] = data.get('ClusterStore').split(':')[0];
+            vlog.dbg("Docker %s key-value store: %s" % (resp['kv_store'], resp['kv_store_url']));
+            if resp['kv_store'] not in ['consul']:
+                vlog.warn("OVN Docker LibNetwork Plugin does not support health checks of %s key-value store" % (resp['kv_store']))
+            else:
+                vlog.dbg("OVN Docker LibNetwork Plugin supports health checks of %s key-value store" % (resp['kv_store']))
+        else:
+            return {"error": "OVN Docker LibNetwork Plugin requires Docker engine configured with a key-value store"}
+    '''
+    Second, determine the plugins loaded by Docker engine. If openvswitch
+    plugin is not on the list, then docker needs to be restarted to discover
+    the plugin.
+    '''
+    resp['plugins'] = reduce(operator.getitem, ['Plugins', 'Network'], data)
+    if resp['plugins']:
+        vlog.dbg("Enabled Docker LibNetwork Plugins: %s" % (', '.join(resp['plugins'])))
+    _is_being_used = False;
+    if 'openvswitch' in resp['plugins']:
+        _is_being_used = True
+    if not _is_being_used:
+        for plugin in resp['plugins']:
+            if re.search(OVN_PLUGIN, plugin):
+                _is_being_used = True
+                break
+    if not _is_being_used:
+        return {"error": "openvswitch driver is not currently used by Docker"}
+    return {'data': resp}
+
+
+def docker_networking():
+    resp = {
+        'networks': {},
+        'endpoints': {}
+    }
+    '''
+    First, acquire information about Open vSwitch enabled networks
+    and endpoints. This info
+    '''
+    req = docker_ctl('networks')
+    if req.get('error'):
+        vlog.warn("docker-health-check: %s" % (req.get('error')))
+        return {"error": req.get('error')}
+    data = req.get('data')
+    for network in data:
+        if not hasattr(network, 'attrs'):
+            continue
+        if not re.search('docker-ovn-driver', network.attrs.get('Driver')):
+            continue
+        _nid = network.attrs.get('Id')
+        resp['networks'][_nid] = {
+            'Name': network.attrs.get('Name'),
+            'Scope': network.attrs.get('Scope')
+        }
+        if reduce(operator.getitem, ['IPAM', 'Config'], network.attrs):
+            for ipam in reduce(operator.getitem, ['IPAM', 'Config'], network.attrs):
+                _subnet = ipam.get('Subnet')
+                _gateway = ipam.get('Gateway')
+                if 'Subnets' not in resp['networks'][_nid]:
+                    resp['networks'][_nid]['Subnets'] = {}
+                resp['networks'][_nid]['Subnets'][_subnet] = {
+                    'Gateway': _gateway
+                }
+        if network.attrs.get('Options'):
+            resp['networks'][_nid]['Options'] = network.attrs.get('Options')
+        if network.attrs.get('Containers'):
+            for _id in network.attrs.get('Containers'):
+                _eid = reduce(operator.getitem, ['Containers', _id, 'EndpointID'], network.attrs)
+                if not _eid:
+                    continue
+                if len(_eid) > 15:
+                    _eid = _eid[0:15]
+                if _eid not in resp['endpoints']:
+                    resp['endpoints'][_eid] = {}
+                resp['endpoints'][_eid]['ContainerId'] = _id
+                resp['endpoints'][_eid]['NetworkID'] = network.attrs.get('Id')
+                resp['endpoints'][_eid]['NetworkName'] = network.attrs.get('Name')
+                for k in network.attrs['Containers'][_id]:
+                    resp['endpoints'][_eid][k] = reduce(operator.getitem, ['Containers', _id, k], network.attrs)
+    '''
+    Next, collect information about the containers the endpoints belong to,
+    e.g. container creation time, image, state, PID, etc. This information
+    may be used to add additional `external_ids` to OVSDB, to cleanup stale
+    OVSDB ports, and fix key-value store issue, if any.
+    '''
+    for _eid in resp['endpoints']:
+        _cid = reduce(operator.getitem, ['endpoints', _eid, 'ContainerId'], resp)
+        if not _cid:
+            vlog.warn("container id not found for endpoint " % (_eid))
+            continue
+        req = docker_ctl('container', container_id=_cid)
+        if req.get('error'):
+            vlog.warn("docker-health-check: container id %s associated with %s endpoint: %s" % (_cid, _eid, req.get('error')))
+            continue
+        container = req.get('data')
+        if hasattr(container, 'attrs'):
+            resp['endpoints'][_eid]['ContainerImage'] = reduce(operator.getitem, ['Config', 'Image'], container.attrs)
+            resp['endpoints'][_eid]['ContainerPid'] = reduce(operator.getitem, ['State', 'Pid'], container.attrs)
+            resp['endpoints'][_eid]['ContainerStatus'] = reduce(operator.getitem, ['State', 'Status'], container.attrs)
+            resp['endpoints'][_eid]['ContainerStartedAt'] = reduce(operator.getitem, ['State', 'StartedAt'], container.attrs)
+            resp['endpoints'][_eid]['ContainerHostname'] = reduce(operator.getitem, ['Config', 'Hostname'], container.attrs)
+            resp['endpoints'][_eid]['ContainerSandboxID'] = reduce(operator.getitem, ['NetworkSettings', 'SandboxID'], container.attrs)
+            resp['endpoints'][_eid]['ContainerSandboxKey'] = reduce(operator.getitem, ['NetworkSettings', 'SandboxKey'], container.attrs)
+        if hasattr(container, 'name'):
+            resp['endpoints'][_eid]['ContainerName'] = container.name
+
+    return {'data': resp}
+
+
+def openvswitch_ports():
+    resp = {}
+    try:
+        output_lines = ovs_vsctl("list", "Interface").split('\n')
+        port_id = None
+        for line in output_lines:
+            key = line.split(':')[0].strip()
+            plain = line[line.find(':') + 1:].strip()
+            if key not in ['_uuid', 'name', 'error', 'admin_state', 'external_ids']:
+                continue
+            if key == 'external_ids':
+                value = {}
+                if plain == '{}':
+                    continue
+                for kv in plain.lstrip('{').rstrip('}').split(','):
+                    kv_key = kv.split('=')[0].strip().strip('"').strip("'")
+                    kv_value = ''.join(kv.split('=')[1:]).strip().strip('"').strip("'")
+                    value[kv_key] = kv_value
+            elif key == 'error':
+                if plain == '[]':
+                    continue
+                value = plain.strip().lstrip("[").rstrip("]")
+            else:
+                value = plain.strip().strip('"').strip("'")
+            # vlog.dbg("%s: %s" % (key, value))
+            if key == '_uuid':
+                port_id = value
+                resp[port_id] = {}
+                continue
+            else:
+                resp[port_id][key] = value
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        return {'error': "Failed to lookup interfaces: %s: %s" % (exc_type.__name__, exc_value)}
+    return {'data': resp}
+
+
+def parse_ovs_flow(s):
+    fields = ['cookie', 'duration', 'table', 'n_packets', 'n_bytes', 'idle_age']
+    r = {'match': {}, 'action': {}}
+    for e in s.split(' '):
+        e = e.strip()
+        _match = False
+        for f in fields:
+            if f + '=' in e:
+                r[f] = e.replace(f + '=', '')
+                _match = True
+                break
+        if _match:
+            continue
+        if 'priority=' in e:
+            for el in e.split(','):
+                if 'priority=' in el:
+                    r['priority'] = el.replace('priority=', '')
+                elif 'ip' == el:
+                    r['match']['proto'] = el
+                elif 'nw_dst=' in el:
+                    r['match']['nw_dst'] = el.replace('nw_dst=', '')
+                else:
+                    pass
+        if 'actions=' in e:
+            for el in e.replace('actions=', '').split(','):
+                if 'mod_dl_dst:' in el:
+                    r['action']['mod_dl_dst'] = el.replace('mod_dl_dst:', '')
+                elif 'output:' in el:
+                    r['action']['output'] = el.replace('output:', '')
+    return r
+
+
+def ensure_infra_flows():
+    '''
+    First, create a rule that does not drop incoming VXLAN packets.
+      ovs-ofctl add-flow br-int 'table=8, priority=0, actions=resubmit(,200)'
+    '''
+    _catch_rule_found = False;
+    try:
+        lines = ovs_ofctl("dump-flows", OVN_BRIDGE, "table=%d" % (OVS_PORT_SEC_L2_TABLE));
+        for line in lines.split('\n'):
+            if "priority=0 actions=resubmit(,%d)" % (OVS_IP_LOOKUP_TABLE) in line:
+                _catch_rule_found = True
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info();
+        return {'error': "Failed to lookup flows in table %d: %s: %s" % (OVS_PORT_SEC_L2_TABLE, exc_type.__name__, exc_value)};
+    '''
+    Second, create rule that resubmits a packets to regular pipeline
+    if there is no match in ip lookup table.
+      ovs-ofctl add-flow br-int 'table=200, priority=0, actions=resubmit(,9)'
+    '''
+    _resubmit_rule_found = False;
+    try:
+        lines = ovs_ofctl("dump-flows", OVN_BRIDGE, "table=%d" % (OVS_IP_LOOKUP_TABLE));
+        for line in lines.split('\n'):
+            if "priority=0 actions=resubmit(,%d)" % (OVS_PORT_SEC_IP_TABLE) in line:
+                _resubmit_rule_found = True;
+                break;
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info();
+        return {'error': "Failed to lookup flows in table %d: %s: %s" % (OVS_IP_LOOKUP_TABLE, exc_type.__name__, exc_value)};
+    '''
+    Create the rules, if necessary.
+    '''
+    if not _catch_rule_found:
+        try:
+            flow = 'table=%d, priority=0, action=resubmit(,%d)' % (OVS_PORT_SEC_L2_TABLE, OVS_IP_LOOKUP_TABLE);
+            ovs_ofctl("add-flow", OVN_BRIDGE, flow);
+            vlog.dbg("Added catch-all IP lookup flow in table=%d pointing to table=%d" % (OVS_PORT_SEC_L2_TABLE, OVS_IP_LOOKUP_TABLE));
+        except:
+            exc_type, exc_value, exc_traceback = sys.exc_info();
+            return {'error': "Failed to add catch-all flow to table %d: %s: %s" % (OVS_PORT_SEC_L2_TABLE, exc_type.__name__, exc_value)};
+
+    '''
+    Create the rules, if necessary.
+    '''
+    if not _resubmit_rule_found:
+        try:
+            flow = 'table=%d, priority=0, action=resubmit(,%d)' % (OVS_IP_LOOKUP_TABLE, OVS_PORT_SEC_IP_TABLE);
+            ovs_ofctl("add-flow", OVN_BRIDGE, flow);
+            vlog.dbg("Added resubmit IP lookup flow in table=%d pointing to table=%d" % (OVS_IP_LOOKUP_TABLE, OVS_PORT_SEC_IP_TABLE));
+        except:
+            exc_type, exc_value, exc_traceback = sys.exc_info();
+            return {'error': "Failed to add resubmit flow to table %d: %s: %s" % (OVS_IP_LOOKUP_TABLE, exc_type.__name__, exc_value)};
+    return {};
+
+
+def openvswitch_flows(data):
+    lookup_table = {}
+    for endpoint in data:
+        if 'IPv4Address' not in data[endpoint]:
+            continue
+        ip = data[endpoint]['IPv4Address'].split('/')[0]
+        lookup_table[ip] = {
+            'port': endpoint,
+            'mac': data[endpoint]['MacAddress'],
+            'action': 'add',
+        }
+    try:
+        lines = ovs_ofctl("dump-flows", OVN_BRIDGE, "table=%d" % (OVS_IP_LOOKUP_TABLE))
+        for line in lines.split('\n'):
+            entry = parse_ovs_flow(line)
+            if 'nw_dst' not in entry['match']:
+                continue
+            if 'mod_dl_dst' not in entry['action']:
+                continue
+            if 'output' not in entry['action']:
+                continue
+            ip = entry['match']['nw_dst']
+            mac = entry['action']['mod_dl_dst']
+            ofport = entry['action']['output']
+            if ip in lookup_table:
+                if lookup_table[ip]['mac'] != mac:
+                    lookup_table[ip]['action'] = 'refresh'
+                    continue
+                if 'ofport' in lookup_table:
+                    if lookup_table[ip]['ofport'] != ofport:
+                        lookup_table[ip]['action'] = 'refresh'
+                        continue
+                else:
+                    lookup_table[ip]['ofport'] = ofport
+                lookup_table[ip]['action'] = 'no'
+            else:
+                lookup_table[ip] = {'action': 'remove'}
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        return {'error': "Failed to lookup flows in table %d: %s: %s" % (OVS_IP_LOOKUP_TABLE, exc_type.__name__, exc_value)}
+
+    for ip in lookup_table:
+        if lookup_table[ip]['action'] == 'no':
+            continue
+        if lookup_table[ip]['action'] in ['remove', 'refresh']:
+            try:
+                flow = 'table=%s,ip,nw_dst=%s' % (OVS_IP_LOOKUP_TABLE, ip)
+                ovs_ofctl("del-flows", OVN_BRIDGE, flow)
+                vlog.dbg("Removed IP lookup flow %s from %s" % (flow, OVN_BRIDGE))
+            except:
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                vlog.warn("failed to remove ip flow %s: %s: %s" % (ip, exc_type.__name__, exc_value))
+        if lookup_table[ip]['action'] in ['add', 'refresh']:
+            try:
+                mac = lookup_table[ip]['mac']
+                port = lookup_table[ip]['port']
+                flow = 'table=%s, priority=200, ip,nw_dst=%s, actions=mod_dl_dst:%s,output:%s' % (OVS_IP_LOOKUP_TABLE, ip, mac, port)
+                ovs_ofctl("add-flow", OVN_BRIDGE, flow)
+                vlog.dbg("Added IP lookup flow %s to %s" % (flow, OVN_BRIDGE))
+            except:
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                vlog.warn("failed to add ip flow %s: %s: %s" % (ip, exc_type.__name__, exc_value))
+            pass
+    return {'data': lookup_table}
+
+
+def consul_docker_networking(url, network_id):
+    resp = {}
+    network_key = "docker/network/v1.0/endpoint/%s/" % (network_id)
+    url = "%s/v1/kv/%s?recurse&pretty" % (url, network_key)
+    url = url.replace("consul://", "http://")
+    try:
+        r = requests.get(url)
+        if r.status_code != 200:
+            return {"error": "%s: %s" % (r.status_code, r.text)}
+        for entry in r.json():
+            # vlog.dbg("consul_docker_networking: %s" % (entry))
+            if not isinstance(entry, (dict)):
+                continue
+            _key = entry.get('Key')
+            if _key == network_key:
+                continue
+            _value = json.loads(base64.b64decode(entry.get('Value')))
+            resp[_value.get('id')] = _value
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        return {"error": "%s: %s" % (exc_type.__name__, exc_value)}
+    return {'data': resp}
+
+
+def ovn_docker_health_check_thread(interval=300):
+    while True:
+        db = {
+            'docker': {},
+            'openvswitch': {},
+        }
+        try:
+            ''' Gathering information about Docker Engine '''
+            req = docker_engine()
+            if req.get('error'):
+                vlog.warn("docker-health-check: %s" % (req.get('error')))
+                time.sleep(interval)
+                continue
+            vlog.dbg("docker-health-check: docker engine data: %s" % (req.get('data')))
+            db['docker']['engine'] = req.get('data')
+
+            ''' Gathering information about Docker Networks and Endpoints '''
+            req = docker_networking()
+            if req.get('error'):
+                vlog.warn("docker-health-check: %s" % (req.get('error')))
+                time.sleep(interval)
+                continue
+            vlog.dbg("docker-health-check: docker networking data: %s" % (req.get('data')))
+            db['docker']['networking'] = req.get('data')
+
+            ''' Gathering information about Open vSwitch Ports '''
+            req = openvswitch_ports()
+            if req.get('error'):
+                vlog.warn("docker-health-check: ovs-ports: %s" % (req.get('error')))
+                time.sleep(interval)
+                continue
+            vlog.dbg("docker-health-check: ovs-ports: %s" % (req.get('data')))
+            db['openvswitch']['ports'] = req.get('data')
+
+            if app_db['ip_lookup']:
+                req = ensure_infra_flows()
+                if req.get('error'):
+                    vlog.warn("docker-health-check: infra-flows: %s" % (req.get('error')))
+                if 'endpoints' in db['docker']['networking']:
+                    req = openvswitch_flows(db['docker']['networking']['endpoints'])
+                    if req.get('error'):
+                        vlog.warn("docker-health-check: ovs-flows: %s" % (req.get('error')))
+                    else:
+                        vlog.dbg("docker-health-check: ovs-flows: %s" % (req.get('data')))
+                        db['openvswitch']['flows'] = req.get('data')
+            if app_db['docker_driver_scope'] == 'global':
+                ''' Gathering information from the key-value store Docker uses '''
+                kv_store = reduce(operator.getitem, ['docker', 'engine', 'kv_store'], db)
+                kv_store_url = reduce(operator.getitem, ['docker', 'engine', 'kv_store_url'], db)
+                if kv_store == 'consul' and kv_store_url:
+                    for network_id in db['docker']['networking']['networks']:
+                        req = consul_docker_networking(kv_store_url, network_id)
+                        if req.get('error'):
+                            vlog.warn("consul-health-check: %s: %s: %s" % (kv_store_url, network_id, req.get('error')))
+                            pass
+                        else:
+                            vlog.dbg("consul-health-check: %s: %s" % (network_id, req.get('data')))
+                            #vlog.info("%s" % (str(app_db)))
+                            db['docker']['networking']['networks'][network_id]['KeyValueStore'] = req.get('data')
+
+            #vlog.dbg("%s" % (db))
+
+            ''' Remove the ports that are no longer present on the host from OVN NB database '''
+            if 'networks' in app_db:
+                for network_id in app_db['networks']:
+                    if 'Containers' not in app_db['networks'][network_id]:
+                        continue
+                    del_ovs_ports = []
+                    del_ovn_ports = []
+                    for ovs_port in app_db['networks'][network_id]['Containers']:
+                        ovs_port_added = None
+                        ovs_port_eid = None
+                        if 'Added' in app_db['networks'][network_id]['Containers'][ovs_port]:
+                            ovs_port_added = app_db['networks'][network_id]['Containers'][ovs_port]['Added']
+                        if 'EndpointID' in app_db['networks'][network_id]['Containers'][ovs_port]:
+                            ovs_port_eid = app_db['networks'][network_id]['Containers'][ovs_port]['EndpointID']
+                        if not ovs_port_eid:
+                            del_ovs_ports.append(ovs_port)
+                            continue
+                        if not ovs_port_added:
+                            del_ovn_ports.append(ovs_port_eid)
+                            continue
+                    for ovn_port in del_ovn_ports:
+                        resp = ovn_nbctl("lsp-del", ovn_port)
+                        if 'error' not in resp:
+                            vlog.dbg("ovnnb: deleted logical switch port %s" % (ovn_port))
+                        else:
+                            vlog.warn("ovnnb: failed to delete logical switch port %s: %s" % (ovn_port, resp['error']))
+                        del_ovs_ports.append(ovn_port[0:15])
+                    for ovs_port in del_ovs_ports:
+                        with app_lock:
+                            del app_db['networks'][network_id]['Containers'][ovs_port]
+                ''' Remove the network that are no longer in use '''
+                with app_lock:
+                    if len(app_db['networks']) > 0:
+                        removal_candidates = []
+                        for network_id in app_db['networks']:
+                            try:
+                                _found = reduce(operator.getitem, ['docker', 'networking', 'networks', network_id], db)
+                            except:
+                                if network_id not in removal_candidates:
+                                    removal_candidates.append(network_id)
+                        for network_id in removal_candidates:
+                            vlog.info("NetworkID %s is not found in Docker engine, deleting from cache" % (network_id))
+                            try:
+                                del app_db['networks'][network_id]
+                            except:
+                                pass
+        except:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            vlog.warn("exception: %s: %s" % (exc_type.__name__, exc_value))
+            for exc_line in traceback.format_tb(exc_traceback):
+                vlog.warn("exception: %s" % (exc_line))
+        finally:
+            with app_lock:
+                app_db['docker_last_synched'] = time.time()
+        time.sleep(interval)
+
+
+def ovn_add_bridge():
+    try:
+        br_list = ovs_vsctl("list-br").split()
+        if OVN_BRIDGE not in br_list:
+            ovs_vsctl("--", "--may-exist", "add-br", OVN_BRIDGE,
+                  "--", "set", "bridge", OVN_BRIDGE,
+                  "external_ids:bridge-id=" + OVN_BRIDGE,
+                  "other-config:disable-in-band=true", "fail-mode=secure")
+        ovs_vsctl("set", "open_vswitch", ".", "external_ids:ovn-bridge=" + OVN_BRIDGE)
+        vlog.info("OVN bridge: %s" % (OVN_BRIDGE))
+    except:
+        vlog.warn("Failed setting OVN bridge info")
+        return True
+    return False
+
+def ovn_add_master():
+    global OVN_NB
+    global app_db
+    try:
+        OVN_NB = ovs_vsctl("get", "Open_vSwitch", ".", "external_ids:ovn-nb").strip('"')
+    except:
+        vlog.warn("OVN central database's ip address not set")
+        return True
+    if not OVN_NB:
+        vlog.warn("OVN central database's ip address not set")
+        return True
+    if app_db is None:
+        app_db = {}
+    tls_private_key = ""
+    tls_key_cert = ""
+    tls_ca_cert = ""
+    if re.match("ssl:", OVN_NB):
+        try:
+            tls_private_key = ovs_vsctl("get", "SSL", ".", "private_key").strip('"')
+            tls_key_cert = ovs_vsctl("get", "SSL", ".", "certificate").strip('"')
+            tls_ca_cert = ovs_vsctl("get", "SSL", ".", "ca_cert").strip('"')
+        except:
+            vlog.warn("Failed getting OVN SSL certificate info")
+            return True
+        app_db['tls_private_key'] = tls_private_key
+        app_db['tls_key_cert'] = tls_key_cert
+        app_db['tls_ca_cert'] = tls_ca_cert
+    app_db['ovn_nb'] = OVN_NB
+    return False
+
+
+def ovn_add_system_id():
+    global OVN_SYSTEM_ID
+    try:
+        fh = open(OVN_SYSTEM_ID_FILE)
+        OVN_SYSTEM_ID = fh.read()
+        fh.close()
+        vlog.info("OVN system-id: %s" % (OVN_SYSTEM_ID))
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        vlog.warn("OVN system-id error: %s: %s" % (exc_type.__name__, exc_value))
+        return True
+    return False
+
+
+def ovn_init_driver():
+    if ovn_add_system_id():
+        return True
+    if ovn_add_master():
+        return True
+    if ovn_add_bridge():
+        return True
+    return False
+
+
+def ovs_init_driver():
+    global app_db
+    parser = argparse.ArgumentParser()
+    plugin_group = parser.add_argument_group('Plugin Options');
+    plugin_group.add_argument('--bind-ip', dest='bind_ip', type=str,
+        default='0.0.0.0', metavar='IP-ADDRESS',
+        help='The IP address to bind the plugin to. Default is \
+              listening on all addresses')
+    plugin_group.add_argument('--bind-port', dest='bind_port', type=int,
+        default=9105, metavar='TCP-PORT',
+        help='The TCP port to bind the plugin to. Default is tcp/9105')
+    plugin_group.add_argument('--distributed', dest='distributed',
+        action='store_true',
+        help='By default this plugin creates a logical switch on per \
+        key-value store basis. This means that the containers in a cluster \
+        managed by one key-value store cannot share Layer 2 domain, i.e. \
+        logical switch, with the containers in a cluster managed by different \
+        key-value store. The reason is that the plugin derives the logical \
+        switch name from the NetworkID passed to it by Docker LibNetwork. \
+        That NetworkID is key-value store specific, i.e. cluster specific. \
+        When this option is enabled, the logical switch name is derived \
+        from the subnet. This way a logical switch may stretch cross multiple \
+        clusters managed by different key-value stores.')
+    plugin_group.add_argument('--ip-lookup', dest='ip_lookup',
+        action='store_true',
+        help='In cases where local OVS instance has non-GENEVE tunnels, \
+        there is a need to perform port lookups for the ports \
+        interconnecting containers, because non-GENEVE tunnels do not \
+        carry logical output ports. Such lookups will be based on \
+        the IP address of a container. If this option is enabled, \
+        the plugin creates OpenFlow rules to allow the lookups. The \
+        flow table containing the IP addresses of the containers is 200.')
+    plugin_group.add_argument('--plugin-cache', dest='plugin_cache',
+        type=str, metavar='PATH',
+        help='The path to plugin cache.')
+    health_group = parser.add_argument_group('Health Check Options');
+    health_group.add_argument('--health-check-on', dest='health_check_enabled',
+        action='store_true',
+        help='By default this plugin does not connect to Docker daemon for \
+        the purposes of network cleanup, synchronization, and acquisition of \
+        additional information about containers connected to its ports. If \
+        enabled, the plugin connects to Docker daemon and adds application \
+        level info to local OVSDB and remote OVN NB databases. Also, the \
+        plugin cleans up stale entries in key value store, removes \
+        non-existent ports, etc.')
+    health_group.add_argument('--health-check-interval', dest='health_check_interval',
+        type=int, default=300, metavar='SECONDS',
+        help='The interval between health checks. Defaults to 5 minutes.')
+    docker_group = parser.add_argument_group('Docker Options');
+    docker_group.add_argument('--docker-plugin-dir', dest='docker_plugin_dir',
+        type=str, metavar='PATH', default="/etc/docker/plugins/",
+        help='The plugin creates a .spec file in the directory specified using \
+        this option. By default, it is /etc/docker/plugins.')
+    docker_group.add_argument('--docker-plugin-file', dest='docker_plugin_file',
+        type=str, metavar='FILENAME', default="openvswitch.json",
+        help='The plugin specification file name')
+    docker_group.add_argument('--docker-driver-scope', dest='docker_driver_scope',
+        type=str, choices=['local', 'global'], metavar='SCOPE',
+        help='By default, the scope of this plugin is \'global\', because Docker \
+        key-value store is required. This requirement stems from the facts that IP \
+        address allocation for the containers is done across the entire cluster. \
+        However, if IPAM driver does not depend on the key-value store, then \
+        set the scope to \'local\'')
+    docker_group.add_argument('--docker-socket', dest='docker_socket',
+        type=str, default='unix://var/run/docker.sock', metavar='UDS or URL',
+        help='The unix domain socket or URL the Docker daemon listens on. By \
+        default, unix://var/run/docker.sock is used.')
+    docker_group.add_argument('--docker-api-version', dest='docker_api_version',
+        type=str, default='1.22', metavar='VERSION',
+        help='The version of Docker API to use. Please read \
+        https://docs.docker.com/engine/api/latest/ for more details.')
+
+    ovs.vlog.add_args(parser)
+    ovs.daemon.add_args(parser)
+    args = parser.parse_args()
+    ovs.vlog.handle_args(args)
+    ovs.daemon.handle_args(args)
+    ovn_init_driver()
+
+    if not os.path.isdir(args.docker_plugin_dir):
+        os.makedirs(args.docker_plugin_dir)
+
+    ovs.daemon.daemonize()
+
+    app_db = {
+        'plugin_name': OVN_PLUGIN,
+        'plugin_libdir': '/var/lib/openvswitch/',
+        'ip_lookup': False,
+        'networks': {},
+        'docker_socket': 'unix://var/run/docker.sock',
+        'docker_api_version': '1.22',
+        'health_check_enabled': False,
+        'health_check_interval': 300,
+    }
+
+    if not args.plugin_cache:
+        app_db['plugin_cache'] = os.path.join(app_db['plugin_libdir'], '%s.pickle' % (app_db['plugin_name']))
+    else:
+        app_db['plugin_cache'] = args.plugin_cache
+
+    if os.path.isfile(app_db['plugin_cache']):
+        with open(app_db['plugin_cache'], 'rb') as f:
+            app_db['networks'] = pickle.load(f)
+        vlog.info("loaded local cache from: %s" % (app_db['plugin_cache']))
+    else:
+        vlog.info("local cache not found in: %s" % (app_db['plugin_cache']))
+
+    vlog.info("init arguments: %s" % (' '.join(sys.argv)))
+
+    try:
+        app_db['bind_ip'] = args.bind_ip
+        app_db['bind_port'] = args.bind_port
+        app_db['distributed'] = args.distributed
+        app_db['ip_lookup'] = args.ip_lookup
+        app_db['health_check_enabled'] = args.health_check_enabled
+        app_db['health_check_interval'] = args.health_check_interval
+        app_db['docker_plugin_dir'] = args.docker_plugin_dir
+        app_db['docker_plugin_file'] = os.path.join(args.docker_plugin_dir, args.docker_plugin_file)
+        app_db['docker_socket'] = args.docker_socket
+        app_db['docker_api_version'] = args.docker_api_version
+        if args.ip_lookup:
+            vlog.info("IP Lookup Flows are enabled")
+        if args.health_check_enabled:
+            vlog.info("Health check is enabled and runs every %d seconds" % (app_db['health_check_interval']))
+            vlog.info("Docker API %s listening on %s" % (app_db['docker_api_version'], app_db['docker_socket']))
+        if args.docker_driver_scope:
+            app_db['docker_driver_scope'] = args.docker_driver_scope
+        if hasattr(args, 'log_file'):
+            app_db['log_file'] = str(args.log_file)
+        vlog.info("Docker plugin specification file: %s" % (app_db['docker_plugin_file']))
+    except Exception as e:
+        vlog.fatal(0, "Failed to write to spec file (%s)" % str(e))
+
+    vlog.set_levels_from_string("any:syslog:off")
+    vlog.set_levels_from_string("any:console:off")
+
+    if args.distributed:
+        vlog.info("distributed mode is enabled")
+        try:
+            global ipaddress
+            import ipaddress
+            global docker
+            import docker
+            global traceback
+            import traceback
+            global requests
+            import requests
+            global base64
+            import base64
+        except:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            vlog.warn("Docker integration is unsupported: %s: %s" % (exc_type.__name__, exc_value))
+            return
+
+    if args.health_check_enabled:
+        ovn_docker_health_check()
+
+
+@app.route('/Plugin.Activate', methods=['POST'])
+def plugin_activate():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    return jsonify({"Implements": ["NetworkDriver"]})
+
+
+@app.route('/NetworkDriver.GetCapabilities', methods=['POST'])
+def get_capability():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    return jsonify({"Scope": app_db['docker_driver_scope']})
+
+
+@app.route('/NetworkDriver.DiscoverNew', methods=['POST'])
+def new_discovery():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    return jsonify({})
+
+
+@app.route('/NetworkDriver.DiscoverDelete', methods=['POST'])
+def delete_discovery():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    return jsonify({})
+
+
+@app.route('/NetworkDriver.CreateNetwork', methods=['POST'])
+def create_network():
+    global app_db
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    if not request.data:
+        abort(400)
+
+    data = json.loads(request.data)
+
+    network = data.get("NetworkID", None)
+    if not network:
+        abort(400)
+
+    # Limit subnet handling to ipv4 till ipv6 usecase is clear.
+    ipv4_data = data.get("IPv4Data", None)
+    if not ipv4_data:
+        error = "create_network: No ipv4 subnet provided"
+        return jsonify({'Err': error})
+
+    subnet = ipv4_data[0].get("Pool", None)
+    if not subnet:
+        error = "create_network: no subnet in ipv4 data from libnetwork"
+        return jsonify({'Err': error})
+
+    gateway_ip = ipv4_data[0].get("Gateway", "").rsplit('/', 1)[0]
+    if gateway_ip == "":
+        error = "create_network: no gateway in ipv4 data from libnetwork"
+        return jsonify({'Err': error})
+
+    vrf = "default"
+    if "Options" in data:
+        if "com.docker.network.generic" in data["Options"]:
+            if "vrf" in data["Options"]["com.docker.network.generic"]:
+                if data["Options"]["com.docker.network.generic"]["vrf"] != "":
+                    vrf = data["Options"]["com.docker.network.generic"]["vrf"].lower()
+
+    if app_db['distributed']:
+        ls_id = hashlib.sha256("%s-%s" % (vrf, subnet)).hexdigest()
+        resp = ovn_nbctl("ls-list")
+        if 'error' in resp:
+            error = "create_distributed_network: ls-list: subnet: %s, gateway: %s, error: %s" % (subnet, gateway_ip, resp['error'])
+            return jsonify({'Err': error})
+        _ls_found = False
+        if 'data' in resp:
+            for line in resp['data']:
+                if re.search(ls_id, line):
+                    _ls_found = True
+                    break
+        if not _ls_found:
+            vlog.info("NetworkID %s uses OVN logical switch %s" % (network, ls_id))
+            resp = ovn_nbctl("ls-add", ls_id, "--", "set", "Logical_Switch", ls_id, "external_ids:subnet=%s" % subnet, "external_ids:gateway_ip=%s" % gateway_ip, "external_ids:added=%d" % (int(time.time())))
+            if 'error' in resp:
+                error = "create_network: ls-add: network: %s, subnet: %s, gateway: %s, error: %s" % (network, subnet, gateway_ip, resp['error'])
+                vlog.warn(error)
+                return jsonify({'Err': error})
+        vlog.info("NetworkID %s uses OVN logical switch %s" % (network, ls_id))
+        with app_lock:
+            if network not in app_db['networks']:
+                app_db['networks'][network] = {}
+            app_db['networks'][network]['Logical_Switch'] = ls_id
+            app_db['networks'][network]['Subnet'] = subnet
+            app_db['networks'][network]['Gateway'] = gateway_ip
+            app_db['networks'][network]['NetworkID'] = network
+    else:
+        resp = ovn_nbctl("ls-add", network, "--", "set", "Logical_Switch", network, "external_ids:subnet=%s" % subnet, "external_ids:gateway_ip=%s" % gateway_ip, "external_ids:added=%d" % (int(time.time())))
+        if 'error' in resp:
+            error = "create_network: ls-add: network: %s, subnet: %s, gateway: %s, error: %s" % (network, subnet, gateway_ip, resp['error'])
+            vlog.warn(error)
+            return jsonify({'Err': error})
+    return jsonify({})
+
+
+@app.route('/NetworkDriver.DeleteNetwork', methods=['POST'])
+def delete_network():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    if not request.data:
+        abort(400)
+
+    data = json.loads(request.data)
+
+    nid = data.get("NetworkID", "")
+    if not nid:
+        abort(400)
+
+    if app_db['distributed']:
+        with app_lock:
+            if 'networks' in app_db:
+                if nid in app_db['networks']:
+                    del app_db['networks'][nid]
+        return jsonify({})
+    resp = ovn_nbctl("ls-del", nid)
+    if 'error' in resp:
+        error = "delete_network: ls-del %s" % (resp['error'])
+        return jsonify({'Err': error})
+    return jsonify({})
+
+
+@app.route('/NetworkDriver.CreateEndpoint', methods=['POST'])
+def create_endpoint():
+    global app_db
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    if not request.data:
+        abort(400)
+
+    data = json.loads(request.data)
+
+    nid = data.get("NetworkID", "")
+    if not nid:
+        abort(400)
+
+    eid = data.get("EndpointID", "")
+    if not eid:
+        abort(400)
+
+    interface = data.get("Interface", "")
+    if not interface:
+        error = "create_endpoint: no interfaces structure supplied by " \
+                "libnetwork"
+        return jsonify({'Err': error})
+
+    ip_address_and_mask = interface.get("Address", "")
+    if not ip_address_and_mask:
+        error = "create_endpoint: ip address not provided by libnetwork"
+        return jsonify({'Err': error})
+
+    ip_address = ip_address_and_mask.rsplit('/', 1)[0]
+    mac_address_input = interface.get("MacAddress", "")
+    mac_address_output = ""
+
+    if not mac_address_input:
+        mac_address = "02:%02x:%02x:%02x:%02x:%02x" % (random.randint(0, 255),
+                                                       random.randint(0, 255),
+                                                       random.randint(0, 255),
+                                                       random.randint(0, 255),
+                                                       random.randint(0, 255))
+        # Only return a mac address if one did not come as request.
+        mac_address_output = mac_address
+    else:
+        mac_address = mac_address_input
+
+    if app_db['distributed']:
+        try:
+            ip_subnet = ipaddress.ip_network(ip_address_and_mask, strict=False)
+            ip_gateway = next(ip_subnet.hosts())
+        except Exception as e:
+            error = "create_endpoint: failed converting the ip address not provided by libnetwork to subnet: %s" % (str(e))
+            return jsonify({'Err': error})
+
+        ls_id = None
+        error = ""
+        with app_lock:
+            if 'networks' in app_db:
+                if nid in app_db['networks']:
+                    if 'Logical_Switch' in app_db['networks'][nid]:
+                        ls_id = app_db['networks'][nid]['Logical_Switch']
+                    else:
+                        error = "create_endpoint: failed finding the reference to Logical_Switch for NetworkID %s" % (nid)
+                else:
+                    error = "create_endpoint: failed finding the reference to NetworkID %s" % (nid)
+            else:
+                error = "create_endpoint: failed finding the reference to NetworkID %s (no networks)" % (nid)
+        if not ls_id:
+            return jsonify({'Err': error})
+        # Add a logical switch port
+        resp = ovn_nbctl("lsp-add", ls_id, eid, "--", "set", "Logical_Switch_Port",
+            eid, "external_ids:chassis=" + OVN_SYSTEM_ID,
+            "external_ids:added=%d" % (int(time.time())))
+        if 'error' in resp:
+            error = "create_endpoint: Logical_Switch: %s, NetworkID: %s: lsp-add (%s)" % (ls_id, nid, resp['error'])
+            return jsonify({'Err': error})
+
+        # Add OVS Port Entry
+        ovs_port = eid[0:15]
+        ovs_entry = {}
+        ovs_entry['OVSPort'] = ovs_port
+        ovs_entry['MacAddress'] = mac_address
+        ovs_entry['Address'] = ip_address
+        ovs_entry['EndpointID'] = eid
+        with app_lock:
+            if 'networks' not in app_db:
+                app_db['networks'] = {}
+            if nid not in app_db['networks']:
+                app_db['networks'][nid] = {}
+            if 'Containers' not in app_db['networks'][nid]:
+                app_db['networks'][nid]['Containers'] = {}
+            app_db['networks'][nid]['Containers'][ovs_port] = ovs_entry
+    else:
+        # Add a logical switch port
+        resp = ovn_nbctl("lsp-add", nid, eid, "--", "set", "Logical_Switch_Port",
+            eid, "external_ids:chassis=" + OVN_SYSTEM_ID,
+            "external_ids:added=%d" % (int(time.time())))
+        if 'error' in resp:
+            error = "create_endpoint: lsp-add (%s)" % (resp['error'])
+            return jsonify({'Err': error})
+
+    # Add IP-MAC address pair to the logical switch port
+    resp = ovn_nbctl("lsp-set-addresses", eid, mac_address + " " + ip_address)
+    if 'error' in resp:
+        error = "create_endpoint: lsp-set-addresses (%s)" % (resp['error'])
+        return jsonify({'Err': error})
+
+    return jsonify({"Interface":
+        {
+            "Address": "",
+            "AddressIPv6": "",
+            "MacAddress": mac_address_output
+        }
+    })
+
+
+def get_lsp_addresses(eid):
+    resp = ovn_nbctl("--if-exists", "get", "Logical_Switch_Port", eid,
+                    "addresses")
+    if 'error' in resp:
+        error = "get-lsp-addresses for lsp %s failed: %s" % (eid, resp['error'])
+        return (None, None, error)
+    if len(resp['data']) == 0:
+        error = "get-lsp-addresses for lsp %s failed: there are no addresses associated with it" % (eid)
+        return (None, None, error)
+    elif len(resp['data']) > 1:
+        error = "get-lsp-addresses for lsp %s failed: there are multiple addresses associated with the port: %s" % (eid, resp['data'])
+        return (None, None, error)
+    else:
+        pass
+    entry = resp['data'].pop()
+    addresses = entry.strip("[").strip("]").strip('"').strip("'").split()
+    mac_address = addresses[0]
+    ip_address = addresses[1]
+    vlog.dbg("get-lsp-addresses for lsp %s: ip: %s, mac: %s" % (eid, ip_address, mac_address))
+    return (mac_address, ip_address, None)
+
+
+@app.route('/NetworkDriver.EndpointOperInfo', methods=['POST'])
+def show_endpoint():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    if not request.data:
+        abort(400)
+
+    data = json.loads(request.data)
+
+    nid = data.get("NetworkID", "")
+    if not nid:
+        abort(400)
+
+    eid = data.get("EndpointID", "")
+    if not eid:
+        abort(400)
+
+    try:
+        (mac_address, ip_address, error) = get_lsp_addresses(eid)
+        if error:
+            jsonify({'Err': error})
+    except Exception as e:
+        error = "show_endpoint: get Logical_Switch_Port addresses. (%s)" \
+                % (str(e))
+        return jsonify({'Err': error})
+
+    veth_outside = eid[0:15]
+    return jsonify({"Value": {"ip_address": ip_address,
+                              "mac_address": mac_address,
+                              "veth_outside": veth_outside
+                              }})
+
+
+@app.route('/NetworkDriver.DeleteEndpoint', methods=['POST'])
+def delete_endpoint():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    if not request.data:
+        abort(400)
+
+    data = json.loads(request.data)
+
+    nid = data.get("NetworkID", "")
+    if not nid:
+        abort(400)
+
+    eid = data.get("EndpointID", "")
+    if not eid:
+        abort(400)
+
+    resp = ovn_nbctl("lsp-del", eid)
+    if 'error' in resp:
+        error = "delete_endpoint: lsp-del %s: %s" % (eid, resp['error'])
+        return jsonify({'Err': error})
+
+    global app_db
+    if app_db['distributed']:
+        ovs_port = eid[0:15]
+        with app_lock:
+            if nid in app_db['networks']:
+                if 'Containers' in app_db['networks'][nid]:
+                    if ovs_port in app_db['networks'][nid]['Containers']:
+                        del app_db['networks'][nid]['Containers'][ovs_port]
+
+    return jsonify({})
+
+
+@app.route('/NetworkDriver.Join', methods=['POST'])
+def network_join():
+    global app_db
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    if not request.data:
+        abort(400)
+
+    data = json.loads(request.data)
+
+    nid = data.get("NetworkID", "")
+    if not nid:
+        abort(400)
+
+    ip_gateway = ""
+    if app_db['distributed']:
+        ip_gateway = reduce(operator.getitem, ['networks', nid, 'Gateway'], app_db)
+        if not ip_gateway:
+            error = "network_join: unknown NetworkID %s" % (nid)
+            return jsonify({'Err': error})
+
+    eid = data.get("EndpointID", "")
+    if not eid:
+        abort(400)
+
+    sboxkey = data.get("SandboxKey", "")
+    if not sboxkey:
+        abort(400)
+
+    # sboxkey is of the form: /var/run/docker/netns/CONTAINER_ID
+    vm_id = sboxkey.rsplit('/')[-1]
+
+    try:
+        (mac_address, ip_address, error) = get_lsp_addresses(eid)
+        if error:
+            jsonify({'Err': error})
+    except Exception as e:
+        error = "network_join: %s" % (str(e))
+        return jsonify({'Err': error})
+
+    veth_outside = eid[0:15]
+    veth_inside = eid[0:13] + "_c"
+    command = "ip link add %s type veth peer name %s" \
+              % (veth_inside, veth_outside)
+    try:
+        call_popen(shlex.split(command))
+    except Exception as e:
+        error = "network_join: failed to create veth pair (%s)" % (str(e))
+        return jsonify({'Err': error})
+
+    command = "ip link set dev %s address %s" \
+              % (veth_inside, mac_address)
+
+    try:
+        call_popen(shlex.split(command))
+    except Exception as e:
+        error = "network_join: failed to set veth mac address (%s)" % (str(e))
+        return jsonify({'Err': error})
+
+    command = "ip link set %s up" % (veth_outside)
+
+    try:
+        call_popen(shlex.split(command))
+    except Exception as e:
+        error = "network_join: failed to up the veth interface (%s)" % (str(e))
+        return jsonify({'Err': error})
+
+    try:
+        ovs_vsctl("add-port", OVN_BRIDGE, veth_outside)
+        ovs_vsctl("set", "interface", veth_outside,
+                  "external_ids:attached-mac=" + mac_address,
+                  "external_ids:iface-id=" + eid,
+                  "external_ids:vm-id=" + vm_id,
+                  "external_ids:iface-status=active")
+    except Exception as e:
+        error = "network_join: failed to create a port (%s)" % (str(e))
+        return jsonify({'Err': error})
+
+    if app_db['distributed']:
+        ovs_port = eid[0:15]
+        with app_lock:
+            if nid in app_db['networks']:
+                if 'Containers' in app_db['networks'][nid]:
+                    if ovs_port in app_db['networks'][nid]['Containers']:
+                        app_db['networks'][nid]['Containers'][ovs_port]['SandboxKey'] = sboxkey
+                        app_db['networks'][nid]['Containers'][ovs_port]['Added'] = time.time()
+                        if app_db['ip_lookup']:
+                            # Add IP lookup flow for the IP address of the container
+                            port_ip_address = app_db['networks'][nid]['Containers'][ovs_port]['Address']
+                            port_mac_address = app_db['networks'][nid]['Containers'][ovs_port]['MacAddress']
+                            ofdel = 'table=%d,ip,nw_dst=%s' % (OVS_IP_LOOKUP_TABLE, ip_address)
+                            ofadd = 'table=%d, priority=200, ip,nw_dst=%s, actions=mod_dl_dst:%s,output:%s' % (OVS_IP_LOOKUP_TABLE, port_ip_address, port_mac_address, ovs_port)
+                            try:
+                                ovs_ofctl("del-flows", OVN_BRIDGE, ofdel)
+                                ovs_ofctl("add-flow", OVN_BRIDGE, ofadd)
+                                vlog.dbg("Added IP lookup flow for %s with MAC %s on port %s" % (port_ip_address, port_mac_address, ovs_port))
+                            except:
+                                exc_type, exc_value, exc_traceback = sys.exc_info()
+                                vlog.warn("Failed to add IP lookup flow for %s on port %s: %s: %s" % (port_ip_address, ovs_port, exc_type.__name__, exc_value))
+    interface = {
+        "InterfaceName": {
+            "SrcName": veth_inside,
+            "DstPrefix": "eth"
+        },
+        "Gateway": ip_gateway,
+        "GatewayIPv6": ""
+    }
+
+    return jsonify(interface)
+
+
+@app.route('/NetworkDriver.Leave', methods=['POST'])
+def network_leave():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    if not request.data:
+        abort(400)
+
+    data = json.loads(request.data)
+
+    nid = data.get("NetworkID", "")
+    if not nid:
+        abort(400)
+
+    eid = data.get("EndpointID", "")
+    if not eid:
+        abort(400)
+
+    veth_outside = eid[0:15]
+    command = "ip link delete %s" % (veth_outside)
+    try:
+        call_popen(shlex.split(command))
+    except Exception as e:
+        error = "network_leave: failed to delete veth pair (%s)" % (str(e))
+        return jsonify({'Err': error})
+
+    try:
+        ovs_vsctl("--if-exists", "del-port", veth_outside)
+    except Exception as e:
+        error = "network_leave: failed to delete port (%s)" % (str(e))
+        return jsonify({'Err': error})
+
+    global app_db
+    if app_db['distributed']:
+        ovs_port = eid[0:15]
+        with app_lock:
+            if nid in app_db['networks']:
+                if 'Containers' in app_db['networks'][nid]:
+                    if ovs_port in app_db['networks'][nid]['Containers']:
+                        if app_db['ip_lookup']:
+                            # Delete IP lookup flow for the IP address of the container
+                            port_ip_address = app_db['networks'][nid]['Containers'][ovs_port]['Address']
+                            ofdel = 'table=%d,ip,nw_dst=%s' % (OVS_IP_LOOKUP_TABLE, ip_address)
+                            try:
+                                ovs_ofctl("del-flows", OVN_BRIDGE, ofdel)
+                                vlog.dbg("Removed IP lookup flow for %s on port %s" % (port_ip_address, ovs_port))
+                            except:
+                                exc_type, exc_value, exc_traceback = sys.exc_info()
+                                vlog.warn("Failed to remove IP lookup flow for %s on port %s: %s: %s" % (port_ip_address, ovs_port, exc_type.__name__, exc_value))
+                        del app_db['networks'][nid]['Containers'][ovs_port]
+
+    return jsonify({})
+
+
+@app.route('/NetworkDriver.Database', methods=['GET'])
+def network_db():
+    global app_db
+    vlog.info("received %s request to: %s" % (request.method, request.path))
+    return jsonify(app_db)
+
+
+def parse_ovs_opf_bridge_ports(data):
+    ports = {}
+    try:
+        _id = None
+        for line in data:
+            rx_regex = re.match("\s+port\s+(.?\S+.?|\d+|LOCAL):\s+rx\s+(pkts.*)", line)
+            counters = None
+            if rx_regex:
+                _id = str(rx_regex.group(1)).strip('"')
+                if _id == "LOCAL":
+                    _id = "0"
+                counters = str(rx_regex.group(2)).split(',')
+                _dir = 'rx_'
+            elif re.match("\s+tx (pkts.*)", line):
+                counters = line.split(',')
+                _dir = 'tx_'
+            else:
+                continue
+            if not counters:
+                continue
+            if not _id:
+                continue
+            for counter in counters:
+                counter_pair = counter.strip().split('=')
+                if _id not in ports:
+                    ports[_id] = {}
+                k = _dir + counter_pair[0]
+                value = counter_pair[1]
+                if counter_pair[1] == '?':
+                    value = 0
+                try:
+                    ports[_id][k] = int(value)
+                except:
+                    pass
+            if _dir == "tx_":
+                _id = None
+            del counters
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        vlog.warn("%s: %s: %s" % (exc_type, exc_value, traceback.format_tb(exc_traceback)))
+    return ports
+
+def parse_ovs_opf_bridge(data):
+    bridge = {}
+    try:
+        _id = None
+        for line in data:
+            dpid_regex = re.match("^OFPT_FEATURES_REPLY.*dpid:(.*)", line)
+            counter_regex = re.match("n_tables", line)
+            cap_regex = re.match("capabilities:", line)
+            action_regex = re.match("actions:", line)
+            port_regex = re.match("\s+(\S+)\((\S+)\):\s+addr:(\S+)", line)
+            if dpid_regex:
+                bridge['dpid'] = dpid_regex.group(1)
+            elif counter_regex:
+                counters = line.split(' ')
+                for counter in counters:
+                    counter_pair = counter.rstrip(',').split(':')
+                    if len(counter_pair) != 2:
+                        continue
+                    try:
+                        bridge[counter_pair[0]] = int(counter_pair[1])
+                    except:
+                        pass
+            elif cap_regex:
+                bridge['capabilities'] = line.split(' ')
+                bridge['capabilities'].pop(0)
+            elif action_regex:
+                bridge['actions'] = line.split(' ')
+                bridge['actions'].pop(0)
+            elif port_regex:
+                try:
+                    port_id = port_regex.group(1)
+                    port_name = port_regex.group(2)
+                    port_mac_address = port_regex.group(3)
+                    if not re.match("\d+", port_id):
+                        port_id = "0"
+                    if 'ports' not in bridge:
+                        bridge['ports'] = {}
+                    if 'ofports' not in bridge:
+                        bridge['ofports'] = {}
+                    if 'mac_address' not in bridge:
+                        bridge['mac_address'] = {}
+                    if port_name not in bridge['ports']:
+                        bridge['ports'][port_name] = {}
+                    bridge['ports'][port_name]['ofport'] = port_id
+                    bridge['ports'][port_name]['mac_address'] = port_mac_address
+                    bridge['ofports'][port_id] = port_name
+                    bridge['mac_address'][port_mac_address] = port_name
+                except:
+                    pass
+            else:
+                pass
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        vlog.warn("%s: %s: %s" % (exc_type, exc_value, traceback.format_tb(exc_traceback)))
+    return bridge
+
+
+@app.route('/NetworkDriver.OvsBridge', methods=['GET'])
+def ovs_opf_bridge():
+    '''
+    Runs "ovs-ofctl show <bridge>" command.
+    '''
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    try:
+        resp = exec_cmd(["ovs-ofctl", "show", OVN_BRIDGE], True)
+        if 'error' in resp:
+            return jsonify({'Err': resp['error']})
+        bridge = parse_ovs_opf_bridge(resp['data'])
+        ports = exec_cmd(["ovs-ofctl", "dump-ports", OVN_BRIDGE], True)
+        if 'error' in ports:
+            return jsonify({'Err': ports['error']})
+        bridge['statistics'] = parse_ovs_opf_bridge_ports(ports['data'])
+        return jsonify(bridge)
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        vlog.warn("%s: %s: %s" % (exc_type, exc_value, traceback.format_tb(exc_traceback)))
+        return jsonify({'Err': "%s: %s" % (exc_type, exc_value)})
+
+
+def parse_ovs_opf_flows(data):
+    flows = []
+    try:
+        for line in data:
+            flows.append(line.strip())
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        vlog.warn("%s: %s: %s" % (exc_type, exc_value, traceback.format_tb(exc_traceback)))
+    return flows
+
+
+@app.route('/NetworkDriver.OvsFlows', methods=['GET'])
+def ovs_opf_flows():
+    '''
+    Runs "ovs-ofctl dump-flows <bridge> command".
+    '''
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    try:
+        resp = exec_cmd(["ovs-ofctl", "dump-flows", OVN_BRIDGE], True)
+        if 'error' in resp:
+            return jsonify({'Err': resp['error']})
+        flows = parse_ovs_opf_flows(resp['data'])
+        return jsonify({'Flows': flows})
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        vlog.warn("%s: %s: %s" % (exc_type, exc_value, traceback.format_tb(exc_traceback)))
+        return jsonify({'Err': "%s: %s" % (exc_type, exc_value)})
+
+
+def parse_ovs_datapath_flows(data):
+    flows = []
+    try:
+        for line in data:
+            flows.append(line.strip())
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        vlog.warn("%s: %s: %s" % (exc_type, exc_value, traceback.format_tb(exc_traceback)))
+    return flows
+
+
+@app.route('/NetworkDriver.OvsDatapathFlows', methods=['GET'])
+def ovs_datapath_flows():
+    '''
+    Runs "ovs-dpctl dump-flows" command.
+    '''
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    try:
+        resp = exec_cmd(["ovs-dpctl", "dump-flows"], True)
+        if 'error' in resp:
+            return jsonify({'Err': resp['error']})
+        flows = parse_ovs_datapath_flows(resp['data'])
+        return jsonify({'Flows': flows})
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        vlog.warn("%s: %s: %s" % (exc_type, exc_value, traceback.format_tb(exc_traceback)))
+        return jsonify({'Err': "%s: %s" % (exc_type, exc_value)})
+
+
+@app.route('/NetworkDriver.ProgramExternalConnectivity', methods=['POST'])
+def program_external_connectivity():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    return jsonify({})
+
+
+@app.route('/NetworkDriver.RevokeExternalConnectivity', methods=['POST'])
+def revoke_external_connectivity():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    return jsonify({})
+
+
+@app.route('/NetworkDriver.EventNotify', methods=['POST'])
+def event_notify():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    return jsonify({})
+
+
+def get_vlog_levels():
+    log_levels = {}
+    for line in vlog.get_levels().split('\n'):
+        parts = [x for x in line.split() if x]
+        if len(parts) != 4:
+            continue
+        log_levels[parts[0]] = {
+            'console': parts[1],
+            'syslog': parts[2],
+            'file': parts[3]
+        }
+    return log_levels
+
+
+@app.route('/NetworkDriver.SetLogLevels', methods=['POST'])
+def set_log_levels():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    allowed_log_levels = ['emer', 'err', 'warn', 'info', 'dbg']
+    if not request.data:
+        return jsonify({'Err': 'Log level must be one of %s' % (allowed_log_levels)})
+    data = json.loads(request.data)
+    log_level = data.get("LogLevel", None)
+    if not log_level:
+        return jsonify({'Err': 'Log level must be one of %s' % (allowed_log_levels)})
+    if log_level not in allowed_log_levels:
+        return jsonify({'Err': 'Log level must be one of %s, but received %s' % (allowed_log_levels, log_level)})
+    vlog.set_levels_from_string("any:file:%s" % (log_level))
+    return jsonify({'LogLevels': get_vlog_levels()})
+
+
+@app.route('/NetworkDriver.GetLogLevels', methods=['GET'])
+def get_log_levels():
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data))
+    return jsonify({'LogLevels': get_vlog_levels()})
+
+
+def parse_interfaces(data):
+    interfaces = {}
+    try:
+        _id = None
+        _dir = 'rx_'
+        _fields = ''
+        for line in data:
+            mg0 = re.match("^(\d+):\s+(\S+):\s+<(\S+)>\smtu\s(\d+)", line)
+            mg1 = re.search("ether\s(\S+)\s", line)
+            mg2 = re.search("\sinet\s(\S+)\s", line)
+            mg3 = re.search("\sinet6\s(\S+)\s", line)
+            mg4 = re.match("^\s+(RX|TX):\s(.*)", line)
+            mg5 = re.match("^\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)", line)
+            if mg0:
+                _id = mg0.group(2)
+                if _id not in interfaces:
+                    interfaces[_id] = {}
+                interfaces[_id]['flags'] = mg0.group(3).split(',')
+                interfaces[_id]['mtu'] = int(mg0.group(4))
+            elif mg1:
+                interfaces[_id]['mac_address'] = mg1.group(1)
+            elif mg2:
+                interfaces[_id]['ipv4'] = mg2.group(1)
+            elif mg3:
+                interfaces[_id]['ipv6'] = mg3.group(1)
+            elif mg4:
+                if mg4.group(1) == 'RX':
+                    _dir = 'rx_'
+                else:
+                    _dir = 'tx_'
+                _fields = [x for x in mg4.group(2).split(' ') if x != '']
+            elif mg5:
+                for i, _field in enumerate(_fields):
+                    try:
+                        interfaces[_id][_dir + _field] = int(mg5.group(i + 1))
+                    except:
+                        pass
+            else:
+                pass
+    except:
+        exc_type, exc_value, exc_traceback = sys.exc_info();
+        vlog.warn("%s: %s: %s" % (exc_type, exc_value, traceback.format_tb(exc_traceback)));
+    return interfaces
+
+
+@app.route('/NetworkDriver.GetInterfaces', methods=['GET'])
+def get_interfaces():
+    '''
+    This function query retrieves network interface table.
+    '''
+    vlog.info("received %s request to: %s, with payload: %s" % (request.method, request.path, request.data));
+    resp = exec_cmd(["ip", "-a", "-s", "addr", "show"])
+    if 'error' in resp:
+        return jsonify({'Err': resp['error']})
+    interfaces = parse_interfaces(resp['data'])
+    return jsonify({'Interfaces': interfaces})
+
+
+@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE'])
+@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
+def unsupported_libnetwork_call():
+    '''
+    This function handles any new endpoints that are being added to
+    Docker libnetwork remote network plugin API. If this function receives
+    a request and that request is valid, there is a need to refactor
+    this plugin, because a new functionality is being introduced.
+    '''
+    error = "received unsupported libnetwork %s request to: %s, with payload: %s" % (request.method, request.path, request.data)
+    vlog.warn(error)
+    return jsonify({'Err': error})
+
+
+def main():
+    ovs_init_driver()
+    vlog.info("listening on http://%s:%d/" % (app_db['bind_ip'], app_db['bind_port']))
+    app.run(host=app_db['bind_ip'], port=app_db['bind_port'], threaded=True)
+
+if __name__ == '__main__':
+    main()
