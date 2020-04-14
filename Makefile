@@ -1,5 +1,5 @@
 .PHONY: test lint clean image plugin
-PLUGIN_NAME:="ovnworks/docker-ovn-driver"
+PLUGIN_NAME:="forward53/docker-ovn-driver"
 PLUGIN_CONTAINTER="docker_ovn_driver"
 PLUGIN_TMP_DIR:="./tmp/"
 PLUGIN_TMP_ROOTFS_DIR:="./tmp/rootfs"
